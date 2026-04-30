@@ -118,13 +118,127 @@ Business scenario examples showing how to use each tool. See `examples/README.md
 
 ### Workflow Hints (`examples/workflow-hints.md`)
 
-> **按需检索，不是静态入口。** 按需检索的上下文片段，按操作类型分组（新建/下推/修改/审批）。
+> **核心参考文件，AI 执行具体任务时按需检索。**
 
 关键内容：
-- 单据生命周期状态机（Save→Submit→Audit）
-- 写操作的完整流程（含 next_action 字段说明）
-- 常见错误模式及处理（字段不存在/关联数量已达上限等）
-- 操作返回的结构化字段含义
+- **单据生命周期状态机**：Save(草稿) → Submit(待审核) → Audit(已审核)
+- **高层复合工具**：`kingdee_create_and_audit`、`kingdee_push_and_audit` 一站式操作
+- **写操作完整流程**：Save → Submit → Audit（含 next_action 字段说明）
+- **操作返回结构化字段**：success/next_action/errors/tip
+- **常见错误处理**：关联数量已达上限、字段不存在、权限不足等
 
-AI 执行具体任务时，按需参考此文件，不要一次性读完所有示例。
+### 测试指南 (`tests/TEST_GUIDE.md`)
+
+生产模块测试参考，包含：
+- 生产订单、计划管理、资产管理、成本管理、调拨管理、质量管理、审计合规
+- 各模块的 form_id 和可用字段
+- 已知问题列表（Demo 环境未启用的模块）
+
+---
+
+## Harness 约束层
+
+`tests/test_harness.py` 定义了操作链约束和反馈循环机制：
+
+### 结构化操作结果
+
+每次写操作返回：
+```json
+{
+  "success": true,
+  "bill_no": "PO001",
+  "fid": "12345",
+  "next_action": "submit",
+  "errors": [{"message": "...", "reason": "...", "suggestion": "..."}]
+}
+```
+
+**判断完成**：检查 `next_action == null` 且 `success == true`。
+
+### 错误模式库 (`KNOWN_ERROR_PATTERNS`)
+
+位于 `server.py` 顶部，自动匹配常见错误：
+
+| 错误关键词 | 原因 | 建议操作 |
+|-----------|------|---------|
+| 502/Bad Gateway | 金蝶不支持 HTTP/2 | 确保 httpx 传 `http1=True` |
+| 会话/session | Session 过期 | 调用 `_login()` 重新登录 |
+| 关联数量 | 累计已达上限 | 检查 FReceiveQty+FStockInQty |
+| 字段不存在 | 字段在当前账套未启用 | 用 `kingdee_get_fields` 确认 |
+| 已被其他用户修改 | 乐观锁冲突 | 重新 `view_bill` 拉最新数据 |
+
+错误命中后会携带 `matched.next_action_tool` 建议下一步工具。
+
+### 单据状态机 (`DOC_LIFECYCLE`)
+
+定义写操作后的状态流转：
+- `save` → 草稿，下一步建议 `submit`
+- `submit` → 待审核，下一步建议 `audit`
+- `audit` → 已审核，操作完成
+- `push` → 目标单草稿，下一步建议 `submit+audit`
+
+---
+
+## 测试问题排查流程
+
+1. **运行测试查看错误**
+   ```bash
+   python -m pytest tests/ -v
+   ```
+
+2. **检查测试指南** (`tests/TEST_GUIDE.md`)
+   - 查看已知问题列表（Demo 环境未启用的模块）
+   - 确认 form_id 和字段是否正确
+
+3. **查阅官方 API 文档**
+   - 使用 MCP 浏览器访问 https://openapi.open.kingdee.com/ApiDoc
+   - 搜索对应业务领域的单据类型
+   - 查看请求参数、响应格式、代码示例
+
+4. **常见 Demo 环境限制**
+   - FLinkQty 不存在 → 用 FReceiveQty+FStockInQty 代替
+   - 某些模块未启用 → form_id 存在但字段不存在
+   - 权限限制 → 联系管理员开通
+
+---
+
+## 使用日志系统
+
+详细文档见 `docs/usage_logging.md`。
+
+### MCP 工具
+
+| 工具 | 说明 |
+|------|------|
+| `kingdee_usage_report` | 查看详细使用报告（text/markdown/json） |
+| `kingdee_usage_stats` | 获取当前会话统计摘要（JSON） |
+
+### 命令行工具
+
+```bash
+# 生成使用报告
+python scripts/usage_report.py
+
+# 输出 Markdown 格式
+python scripts/usage_report.py --format markdown -o report.md
+
+# 分析指定日志文件
+python scripts/usage_report.py --file /path/to/log.jsonl
+```
+
+### 环境变量
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `MCP_USAGE_LOG` | `usage_log.jsonl` | 日志文件名 |
+| `MCP_USAGE_LOG_DIR` | `.` | 日志目录 |
+
+### 日志分析改进
+
+基于日志可以分析：
+- **高频工具** → 优先优化核心流程
+- **高频错误** → 归类到 `KNOWN_ERROR_PATTERNS`
+- **耗时分布** → 定位慢查询
+- **未覆盖场景** → 发现新 API 需求
+
 

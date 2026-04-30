@@ -10,12 +10,314 @@ import asyncio
 import json
 import os
 import re
-from typing import Any, List, Literal, Optional
+import time
+from datetime import datetime
+from typing import Any, List, Literal, Optional, Callable
+from collections import defaultdict
 
 import httpx
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.prompts.base import UserMessage
 from pydantic import BaseModel, ConfigDict, Field
+
+# ─────────────────────────────────────────────
+# 使用日志模块（改进反馈层）
+# 记录每次工具调用的参数、耗时、结果，用于分析改进 MCP
+# ─────────────────────────────────────────────
+_USAGE_LOG_FILE = os.environ.get("MCP_USAGE_LOG", "usage_log.jsonl")
+_ERROR_STATS: dict[str, int] = defaultdict(int)  # 错误类型统计
+_TOOL_STATS: dict[str, dict] = defaultdict(lambda: {
+    "total": 0, "success": 0, "failed": 0, "total_ms": 0
+})
+
+def _get_log_dir() -> str:
+    """获取日志目录，优先使用环境变量指定的目录"""
+    log_dir = os.environ.get("MCP_USAGE_LOG_DIR", ".")
+    os.makedirs(log_dir, exist_ok=True)
+    return log_dir
+
+def _sanitize_params(params: dict, max_len: int = 200) -> dict:
+    """清理参数，移除敏感信息和过长的值"""
+    sensitive_keys = {"password", "secret", "app_sec", "token", "cookie", "session"}
+    sanitized = {}
+    for k, v in params.items():
+        k_lower = k.lower()
+        if k_lower in sensitive_keys:
+            sanitized[k] = "***"
+        elif isinstance(v, str) and len(v) > max_len:
+            sanitized[k] = v[:max_len] + "..."
+        elif isinstance(v, dict):
+            sanitized[k] = _sanitize_params(v, max_len)
+        elif isinstance(v, list) and len(v) > 10:
+            sanitized[k] = v[:10] + [f"...({len(v)-10} more)"]
+        else:
+            sanitized[k] = v
+    return sanitized
+
+def log_tool_usage(tool_name: str, params: dict, duration_ms: float,
+                   success: bool, result_preview: str = "", error_type: str = ""):
+    """记录单次工具调用"""
+    log_entry = {
+        "timestamp": datetime.now().isoformat(),
+        "tool": tool_name,
+        "params_keys": list(params.keys()),
+        "duration_ms": round(duration_ms, 2),
+        "success": success,
+        "error_type": error_type,
+        "result_preview": result_preview[:500] if result_preview else "",
+    }
+    log_path = os.path.join(_get_log_dir(), _USAGE_LOG_FILE)
+    try:
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
+    except Exception:
+        pass  # 日志记录失败不影响主流程
+
+    # 统计聚合
+    _TOOL_STATS[tool_name]["total"] += 1
+    _TOOL_STATS[tool_name]["total_ms"] += duration_ms
+    if success:
+        _TOOL_STATS[tool_name]["success"] += 1
+    else:
+        _TOOL_STATS[tool_name]["failed"] += 1
+        if error_type:
+            _ERROR_STATS[error_type] += 1
+
+def get_usage_stats() -> dict:
+    """获取使用统计摘要"""
+    return {
+        "tool_stats": dict(_TOOL_STATS),
+        "error_stats": dict(_ERROR_STATS),
+        "log_file": os.path.join(_get_log_dir(), _USAGE_LOG_FILE),
+    }
+
+def with_usage_log(tool_name: str):
+    """工具函数日志装饰器：自动记录调用参数、耗时、结果"""
+    def decorator(func: Callable) -> Callable:
+        async def wrapper(*args, **kwargs):
+            start = time.perf_counter()
+            # 从 kwargs 中提取参数（用于日志）
+            params = {}
+            for k, v in kwargs.items():
+                if k not in ("return_response",):
+                    params[k] = v
+            # 如果有 self 参数（类方法），尝试提取其 attributes
+            if args and hasattr(args[0], "__dict__"):
+                instance_attrs = {
+                    k: v for k, v in vars(args[0]).items()
+                    if not k.startswith("_") and k not in ("mcp", "client", "logger")
+                }
+                params["_context"] = _sanitize_params(instance_attrs, max_len=100)
+            sanitized_params = _sanitize_params(params)
+
+            success = False
+            result_preview = ""
+            error_type = ""
+            try:
+                result = await func(*args, **kwargs)
+                success = True
+                if isinstance(result, str):
+                    result_preview = result[:200]
+                return result
+            except Exception as e:
+                error_type = type(e).__name__
+                result_preview = str(e)[:200]
+                raise
+            finally:
+                duration_ms = (time.perf_counter() - start) * 1000
+                log_tool_usage(
+                    tool_name=tool_name,
+                    params=sanitized_params,
+                    duration_ms=duration_ms,
+                    success=success,
+                    result_preview=result_preview,
+                    error_type=error_type,
+                )
+        return wrapper
+    return decorator
+
+
+class ToolLogger:
+    """工具函数日志上下文管理器，使用方法:
+
+    ```python
+    async def kingdee_query_bills(params) -> str:
+        with ToolLogger("kingdee_query_bills", params) as logger:
+            # ... 执行逻辑 ...
+            logger.success(result)
+            return result
+    ```
+    """
+    def __init__(self, tool_name: str, params: dict):
+        self.tool_name = tool_name
+        self.params = _sanitize_params(params)
+        self.start_time = time.perf_counter()
+        self.success = False
+        self.result_preview = ""
+        self.error_type = ""
+
+    def success(self, result: Any = None):
+        self.success = True
+        if result and isinstance(result, str):
+            self.result_preview = result[:200]
+
+    def error(self, exc: Exception):
+        self.error_type = type(exc).__name__
+        self.result_preview = str(exc)[:200]
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        duration_ms = (time.perf_counter() - self.start_time) * 1000
+        if exc_val:
+            self.error(exc_val)
+        log_tool_usage(
+            tool_name=self.tool_name,
+            params=self.params,
+            duration_ms=duration_ms,
+            success=self.success,
+            result_preview=self.result_preview,
+            error_type=self.error_type,
+        )
+        return False  # 不阻止异常传播
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        self.__exit__(exc_type, exc_val, exc_tb)
+        return False
+
+
+def generate_usage_report(log_file: str = None) -> str:
+    """生成使用报告"""
+    import statistics
+
+    if log_file is None:
+        log_file = os.path.join(_get_log_dir(), _USAGE_LOG_FILE)
+
+    if not os.path.exists(log_file):
+        return "日志文件不存在，请先使用 MCP 工具。"
+
+    # 读取所有日志
+    entries = []
+    try:
+        with open(log_file, "r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    entries.append(json.loads(line.strip()))
+                except json.JSONDecodeError:
+                    continue
+    except Exception as e:
+        return f"读取日志失败: {e}"
+
+    if not entries:
+        return "日志为空。"
+
+    # 统计分析
+    total_calls = len(entries)
+    successful = sum(1 for e in entries if e.get("success"))
+    failed = total_calls - successful
+
+    # 工具使用排行
+    tool_counts = defaultdict(int)
+    tool_durations = defaultdict(list)
+    error_types = defaultdict(int)
+    for e in entries:
+        tool_counts[e.get("tool", "unknown")] += 1
+        tool_durations[e.get("tool", "unknown")].append(e.get("duration_ms", 0))
+        if not e.get("success"):
+            err_type = e.get("error_type", "unknown")
+            error_types[err_type] += 1
+
+    # 耗时统计
+    all_durations = [e.get("duration_ms", 0) for e in entries]
+    avg_duration = statistics.mean(all_durations) if all_durations else 0
+    median_duration = statistics.median(all_durations) if all_durations else 0
+
+    # 构建报告
+    report_lines = [
+        "=" * 60,
+        "MCP 使用报告",
+        "=" * 60,
+        f"生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        f"日志文件: {log_file}",
+        f"记录条目: {total_calls}",
+        f"成功/失败: {successful}/{failed} ({successful/total_calls*100:.1f}% 成功率)" if total_calls else "N/A",
+        "",
+        "-" * 60,
+        "📊 工具使用排行 (Top 10)",
+        "-" * 60,
+    ]
+
+    sorted_tools = sorted(tool_counts.items(), key=lambda x: x[1], reverse=True)[:10]
+    for i, (tool, count) in enumerate(sorted_tools, 1):
+        durations = tool_durations[tool]
+        avg_t = statistics.mean(durations) if durations else 0
+        success_rate = sum(1 for e in entries if e.get("tool") == tool and e.get("success")) / count * 100
+        report_lines.append(
+            f"  {i:2}. {tool:<40} {count:4} 次 (平均 {avg_t:.0f}ms, 成功率 {success_rate:.0f}%)"
+        )
+
+    if error_types:
+        report_lines.extend([
+            "",
+            "-" * 60,
+            "❌ 错误类型统计",
+            "-" * 60,
+        ])
+        sorted_errors = sorted(error_types.items(), key=lambda x: x[1], reverse=True)
+        for err_type, count in sorted_errors:
+            report_lines.append(f"  • {err_type}: {count} 次")
+
+    # 时段分布
+    if entries:
+        hours = defaultdict(int)
+        for e in entries:
+            try:
+                hour = datetime.fromisoformat(e.get("timestamp", "")).hour
+                hours[hour] += 1
+            except (ValueError, TypeError):
+                pass
+
+        if hours:
+            report_lines.extend([
+                "",
+                "-" * 60,
+                "⏰ 使用时段分布",
+                "-" * 60,
+            ])
+            max_count = max(hours.values())
+            for h in range(24):
+                count = hours.get(h, 0)
+                bar = "█" * int(count / max_count * 20) if max_count > 0 else ""
+                report_lines.append(f"  {h:02d}:00 {bar} {count}")
+
+    # 性能建议
+    slow_tools = [(t, d) for t, ds in tool_durations.items()
+                  for d in ds if d > 5000]
+    if slow_tools:
+        report_lines.extend([
+            "",
+            "-" * 60,
+            "⚡ 性能建议",
+            "-" * 60,
+        ])
+        tool_slow = defaultdict(list)
+        for t, d in slow_tools:
+            tool_slow[t].append(d)
+        for tool, durations in sorted(tool_slow.items(), key=lambda x: -statistics.mean(x[1]))[:5]:
+            report_lines.append(f"  • {tool}: 平均 {statistics.mean(durations):.0f}ms (建议优化)")
+
+    report_lines.extend([
+        "",
+        "=" * 60,
+        f"📝 如需详细分析，请查看日志文件: {log_file}",
+        "=" * 60,
+    ])
+
+    return "\n".join(report_lines)
 
 # ─────────────────────────────────────────────
 # 已知错误模式库（记忆层）
@@ -280,6 +582,60 @@ _SQL_PASSWORD = os.getenv("MCP_SQLSERVER_PASSWORD", "")
 _SQL_DATABASE = os.getenv("MCP_SQLSERVER_DATABASE", "")
 _SQL_SCHEMA   = os.getenv("MCP_SQLSERVER_SCHEMA", "dbo")
 _SQL_ENABLED  = bool(_SQL_HOST and _SQL_USER and _SQL_PASSWORD)
+
+# ─────────────────────────────────────────────
+# 使用日志工具
+# ─────────────────────────────────────────────
+
+class UsageReportInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    format: str = Field(default="text", description="报告格式: text | markdown | json")
+
+
+@mcp.tool(
+    name="kingdee_usage_report",
+    annotations={"title": "查看使用报告", "readOnlyHint": True, "destructiveHint": False,
+                 "idempotentHint": True, "openWorldHint": False}
+)
+async def kingdee_usage_report(params: UsageReportInput) -> str:
+    """查看 MCP 使用统计报告，包括工具调用频率、成功率、耗时分布等。
+
+    此工具分析已记录的使用日志，帮助了解：
+    - 哪些工具被高频使用
+    - 哪些工具失败率较高
+    - API 调用耗时分布
+    - 使用时段分布
+
+    Returns:
+        str: 使用报告（支持 text/markdown/json 格式）
+    """
+    if params.format == "json":
+        return json.dumps(get_usage_stats(), ensure_ascii=False, indent=2)
+    elif params.format == "markdown":
+        return generate_usage_report()  # 内部会生成适合的格式
+    else:
+        return generate_usage_report()
+
+
+@mcp.tool(
+    name="kingdee_usage_stats",
+    annotations={"title": "查看使用统计", "readOnlyHint": True, "destructiveHint": False,
+                 "idempotentHint": True, "openWorldHint": False}
+)
+async def kingdee_usage_stats() -> str:
+    """获取当前会话的使用统计摘要。
+
+    返回当前进程内聚合的统计数据：
+    - 工具使用次数
+    - 成功/失败次数
+    - 累计耗时
+    - 错误类型统计
+
+    Returns:
+        str: 统计数据的 JSON 格式
+    """
+    return json.dumps(get_usage_stats(), ensure_ascii=False, indent=2)
+
 
 # WebAPI 端点路径
 _EP = {
@@ -856,6 +1212,7 @@ async def _login() -> str:
 async def _post(ep_key: str, payload: Any) -> Any:
     """带自动重新登录的 API 调用（用于 Query 等只读操作）"""
     global _session_id
+    start_time = time.perf_counter()
 
     # Query 的 payload 已是 dict（由 _query_payload 返回）
     # 其他操作的 payload 是 list：[formId, {params}]，需要合并
@@ -864,6 +1221,14 @@ async def _post(ep_key: str, payload: Any) -> Any:
         request_data = {"FormId": form_id, **params}
     else:
         request_data = payload
+        form_id = request_data.get("FormId", "")
+
+    # 记录 API 调用日志
+    api_params = {
+        "ep_key": ep_key,
+        "form_id": form_id if form_id else "",
+        "payload_keys": list(request_data.keys()),
+    }
 
     async def _do_post(session: str) -> httpx.Response:
         # 所有 API 都用 form-urlencoded + JSON string 格式
@@ -875,24 +1240,42 @@ async def _post(ep_key: str, payload: Any) -> Any:
             },
         )
 
-    async with httpx.AsyncClient(timeout=30, proxy=None,
-                                  transport=httpx.AsyncHTTPTransport(http1=True)) as client:
-        # 没有 session 先登录
-        if not _session_id:
-            await _login()
+    success = False
+    error_msg = ""
+    try:
+        async with httpx.AsyncClient(timeout=30, proxy=None,
+                                      transport=httpx.AsyncHTTPTransport(http1=True)) as client:
+            # 没有 session 先登录
+            if not _session_id:
+                await _login()
 
-        resp = await _do_post(_session_id)
-
-        # session 过期则重新登录重试一次
-        if resp.status_code == 401 or (
-            resp.status_code == 200 and
-            ("会话" in resp.text or "session" in resp.text.lower())
-        ):
-            await _login()
             resp = await _do_post(_session_id)
 
-        resp.raise_for_status()
-        return resp.json()
+            # session 过期则重新登录重试一次
+            if resp.status_code == 401 or (
+                resp.status_code == 200 and
+                ("会话" in resp.text or "session" in resp.text.lower())
+            ):
+                await _login()
+                resp = await _do_post(_session_id)
+
+            resp.raise_for_status()
+            success = True
+            return resp.json()
+    except Exception as e:
+        error_msg = str(e)[:200]
+        raise
+    finally:
+        duration_ms = (time.perf_counter() - start_time) * 1000
+        # 使用 API 级别的日志记录
+        log_tool_usage(
+            tool_name=f"api:{ep_key}",
+            params=_sanitize_params(api_params),
+            duration_ms=duration_ms,
+            success=success,
+            result_preview="" if success else error_msg,
+            error_type=type(e).__name__ if not success and 'e' in dir() else "",
+        )
 
 
 async def _post_raw(ep_key: str, form_id: str, model: dict,
@@ -906,6 +1289,14 @@ async def _post_raw(ep_key: str, form_id: str, model: dict,
     - Push: data={"TargetFormId":"...","Numbers":[...],"RuleId":"..."}  （无 Model 包装）
     """
     global _session_id
+    start_time = time.perf_counter()
+
+    # 记录 API 调用参数
+    api_params = {
+        "ep_key": ep_key,
+        "form_id": form_id,
+        "model_keys": list(model.keys()) if isinstance(model, dict) else [],
+    }
 
     # Push: data 直接放字段，不需要 Model 包装
     # Submit/Audit/Unaudiot/Delete: data 里面直接是 {"Ids": ...}，不需要 Model 包装
@@ -937,25 +1328,14 @@ async def _post_raw(ep_key: str, form_id: str, model: dict,
     # Kingdee WebAPI 格式（raw JSON body）：{"formid": "...", "data": "{\"Model\":{...}}"}
     body_str = json.dumps({"formid": form_id, "data": json.dumps(data_obj, ensure_ascii=False)}, ensure_ascii=False)
 
-    async with httpx.AsyncClient(timeout=30, proxy=None,
-                                  transport=httpx.AsyncHTTPTransport(http1=True)) as client:
-        if not _session_id:
-            await _login()
+    success = False
+    error_msg = ""
+    try:
+        async with httpx.AsyncClient(timeout=30, proxy=None,
+                                      transport=httpx.AsyncHTTPTransport(http1=True)) as client:
+            if not _session_id:
+                await _login()
 
-        resp = await client.post(
-            _url(ep_key),
-            content=body_str.encode("utf-8"),
-            headers={
-                "Content-Type": "application/json; charset=utf-8",
-                "Cookie": f"kdservice-sessionid={_session_id}",
-            },
-        )
-
-        if resp.status_code == 401 or (
-            resp.status_code == 200 and
-            ("会话" in resp.text or "session" in resp.text.lower())
-        ):
-            await _login()
             resp = await client.post(
                 _url(ep_key),
                 content=body_str.encode("utf-8"),
@@ -965,8 +1345,36 @@ async def _post_raw(ep_key: str, form_id: str, model: dict,
                 },
             )
 
-        resp.raise_for_status()
-        return resp.json()
+            if resp.status_code == 401 or (
+                resp.status_code == 200 and
+                ("会话" in resp.text or "session" in resp.text.lower())
+            ):
+                await _login()
+                resp = await client.post(
+                    _url(ep_key),
+                    content=body_str.encode("utf-8"),
+                    headers={
+                        "Content-Type": "application/json; charset=utf-8",
+                        "Cookie": f"kdservice-sessionid={_session_id}",
+                    },
+                )
+
+            resp.raise_for_status()
+            success = True
+            return resp.json()
+    except Exception as e:
+        error_msg = str(e)[:200]
+        raise
+    finally:
+        duration_ms = (time.perf_counter() - start_time) * 1000
+        log_tool_usage(
+            tool_name=f"api:{ep_key}",
+            params=_sanitize_params(api_params),
+            duration_ms=duration_ms,
+            success=success,
+            result_preview="" if success else error_msg,
+            error_type=type(e).__name__ if not success and 'e' in dir() else "",
+        )
 
 
 def _rows(result: Any) -> list:
@@ -4888,13 +5296,8 @@ async def kingdee_query_mrp_result(params: MRPResultQueryInput) -> str:
         str: JSON 数组，每条含 FBillNo/FMaterialId/FSrcBillNo/FPurchaseQty 等字段。
     """
     try:
-        result = await _post("query", "PLAN_MRPResult", [
-            "PLAN_MRPResult",
-            params.filter_string,
-            params.top,
-            params.orderby,
-            "FDetailId,FPlanQty,FBillNo,FMaterialId,FUnitId,FPlanDate,FSupplyMrpRuleId,FMrpResultId,FIsExploit,FMoBillNo,FMoEntryId,FPOBillNo,FPOEntryId,FPRBillNo,FPREntryId,FSupplyRuleId,FSourceBillType,FSrcBillId,FSrcBillNo,FSrcBillEntryId,FSupplyRuleId,FSupplyDate,FSupplyOrgId,FSupplyOrgName,FCurrentSupState,FRequireOrgId,FRequireOrgName,FRequireDeptId,FCreatorId,FCreateDate,FModifierId,FModifyDate,FDocumentStatus,FDescription,Fmrpresultentry_l,F_RTV1_TEXT,F_RTV2_TEXT,F_RTV3_TEXT,F_RTV4_DEC,F_RTV5_DEC",
-        ])
+        payload = _query_payload("PLAN_MRPResult", "FDetailId,FPlanQty,FBillNo,FMaterialId,FUnitId,FPlanDate,FMoBillNo,FPOBillNo,FPRBillNo,FSourceBillType,FSrcBillNo,FSupplyOrgId,FRequireOrgId,FSupplyDate,FDocumentStatus", params.filter_string, params.orderby, 0, params.top)
+        result = await _post("query", payload)
         return _fmt(result)
     except Exception as e:
         return _err(e, op="query")
@@ -4921,13 +5324,8 @@ async def kingdee_query_production_plan(params: ProductionPlanQueryInput) -> str
         str: JSON 数组。
     """
     try:
-        result = await _post("query", "PLAN_ProductionPlan", [
-            "PLAN_ProductionPlan",
-            params.filter_string,
-            params.top,
-            params.orderby,
-            "FBillNo,FMaterialId,FPlanQty,FPlanStartDate,FPlanEndDate,FStatus,FWorkShopId,FDocumentStatus",
-        ])
+        payload = _query_payload("PLAN_ProductionPlan", "FBillNo,FMaterialId,FMaterialName,FPlanQty,FPlanStartDate,FPlanEndDate,FStatus,FWorkShopId,FDocumentStatus", params.filter_string, params.orderby, 0, params.top)
+        result = await _post("query", payload)
         return _fmt(result)
     except Exception as e:
         return _err(e, op="query")
@@ -4954,13 +5352,8 @@ async def kingdee_query_production_report(params: ProductionReportQueryInput) ->
         str: JSON 数组，含 FBillNo/FMOId/FMaterialId/FReportQty/FHourQty 等。
     """
     try:
-        result = await _post("query", "PRD_MOReport", [
-            "PRD_MOReport",
-            params.filter_string,
-            params.top,
-            params.orderby,
-            "FBillNo,FMOId,FMOBillNo,FMaterialId,FMaterialName,FReportQty,FUnitId,FFinishedQty,FScrapQty,FHourQty,FWorkStationId,FWorkGroupId,FProcessId,FDocumentStatus,FCreateDate",
-        ])
+        payload = _query_payload("PRD_MOReport", "FBillNo,FMOId,FMOBillNo,FMaterialId,FMaterialName,FReportQty,FUnitId,FFinishedQty,FScrapQty,FHourQty,FWorkStationId,FWorkGroupId,FProcessId,FDocumentStatus,FCreateDate", params.filter_string, params.orderby, 0, params.top)
+        result = await _post("query", payload)
         return _fmt(result)
     except Exception as e:
         return _err(e, op="query")

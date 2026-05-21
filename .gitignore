@@ -29,3 +29,16 @@ ENV/
 # OS
 .DS_Store
 Thumbs.db
+
+# Runtime logs
+usage_log.jsonl
+
+# Tool caches
+.playwright-mcp/
+
+# AI memory (per-machine)
+memory/
+
+# Temp scratch
+temp_*.md
+*.full_backup

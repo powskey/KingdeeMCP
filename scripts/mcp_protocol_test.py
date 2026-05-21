@@ -5,15 +5,16 @@ from mcp.client.stdio import StdioServerParameters, stdio_client
 from mcp import ClientSession
 
 async def run_test():
-    env = {
-        **os.environ,
-        "KINGDEE_SERVER_URL": "http://wcl/k3cloud/",
-        "KINGDEE_ACCT_ID": "69ae8ed35dab20",
-        "KINGDEE_USERNAME": "demo",
-        "KINGDEE_APP_ID": "338898_x+bC0diL0pD8x+8EWe3CUayNygSaSDoI",
-        "KINGDEE_APP_SEC": "f8b75d4cc5484c98a8803f7b045e06be",
+    # 凭证从父进程环境继承（运行前先 export/set），未设置时给占位符默认值
+    defaults = {
+        "KINGDEE_SERVER_URL": "http://your-server/k3cloud/",
+        "KINGDEE_ACCT_ID": "your-acct-id",
+        "KINGDEE_USERNAME": "your-username",
+        "KINGDEE_APP_ID": "your-app-id",
+        "KINGDEE_APP_SEC": "your-app-secret",
         "KINGDEE_LCID": "2052",
     }
+    env = {**defaults, **os.environ}
     server_params = StdioServerParameters(
         command=sys.executable,
         args=["-c",

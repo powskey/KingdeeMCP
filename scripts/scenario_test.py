@@ -17,13 +17,13 @@ from kingdee_mcp.server import (
 from unittest.mock import patch, AsyncMock
 
 async def test():
-    # Set env for Kingdee
-    os.environ["KINGDEE_SERVER_URL"] = "http://wcl/k3cloud/"
-    os.environ["KINGDEE_ACCT_ID"] = "69ae8ed35dab20"
-    os.environ["KINGDEE_USERNAME"] = "demo"
-    os.environ["KINGDEE_APP_ID"] = "338898_x+bC0diL0pD8x+8EWe3CUayNygSaSDoI"
-    os.environ["KINGDEE_APP_SEC"] = "f8b75d4cc5484c98a8803f7b045e06be"
-    os.environ["KINGDEE_LCID"] = "2052"
+    # 环境变量从外部传入（运行前先 export/set），未设置时给占位符默认值
+    os.environ.setdefault("KINGDEE_SERVER_URL", "http://your-server/k3cloud/")
+    os.environ.setdefault("KINGDEE_ACCT_ID", "your-acct-id")
+    os.environ.setdefault("KINGDEE_USERNAME", "your-username")
+    os.environ.setdefault("KINGDEE_APP_ID", "your-app-id")
+    os.environ.setdefault("KINGDEE_APP_SEC", "your-app-secret")
+    os.environ.setdefault("KINGDEE_LCID", "2052")
 
     OK = "[OK]"
     FAIL = "[FAIL]"

@@ -29,11 +29,11 @@
 
 | 变量 | 说明 | 示例 |
 |------|------|------|
-| `KINGDEE_SERVER_URL` | 服务器地址，结尾必须是 `/k3cloud/` | `http://wcl/k3cloud/` |
-| `KINGDEE_ACCT_ID` | 账套 ID | `69ae8ed35dab20` |
-| `KINGDEE_USERNAME` | 集成用户名 | `demo` |
-| `KINGDEE_APP_ID` | App ID（管理员在金蝶平台创建） | `338898_x+bC0di...` |
-| `KINGDEE_APP_SEC` | App Secret | `f8b75d4cc5484c...` |
+| `KINGDEE_SERVER_URL` | 服务器地址，结尾必须是 `/k3cloud/` | `http://your-server/k3cloud/` |
+| `KINGDEE_ACCT_ID` | 账套 ID | `your-acct-id` |
+| `KINGDEE_USERNAME` | 集成用户名 | `your-username` |
+| `KINGDEE_APP_ID` | App ID（管理员在金蝶平台创建） | `your-app-id` |
+| `KINGDEE_APP_SEC` | App Secret | `your-app-secret` |
 | `KINGDEE_LCID` | 语言标识（可选，默认 2052=简体中文） | `2052` |
 
 ### 可选：SQL Server 探查
@@ -46,7 +46,7 @@
 | `MCP_SQLSERVER_USER` | 用户名 |
 | `MCP_SQLSERVER_PASSWORD` | 密码 |
 
-> **Demo 环境**：`http://wcl/k3cloud/`，账套 `69ae8ed35dab20`，用户 `demo`
+> 凭证由运维管理员提供并通过环境变量注入，请勿硬编码到任何文件。
 
 ---
 

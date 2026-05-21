@@ -126,11 +126,11 @@ uvx kingdee-mcp
 
 | 变量 | 说明 | 示例 |
 |------|------|------|
-| `KINGDEE_SERVER_URL` | 金蝶服务器地址（需包含 /k3cloud/） | `http://192.168.1.100/k3cloud/` |
-| `KINGDEE_ACCT_ID` | 账套ID | `69ae8ed35dab20` |
-| `KINGDEE_USERNAME` | 集成用户名 | `API集成` |
-| `KINGDEE_APP_ID` | 应用ID | `338898_xxxxx` |
-| `KINGDEE_APP_SEC` | 应用密钥（AppSecret） | `f8b75d4ccxxxx` |
+| `KINGDEE_SERVER_URL` | 金蝶服务器地址（需包含 /k3cloud/） | `http://your-server/k3cloud/` |
+| `KINGDEE_ACCT_ID` | 账套ID | `your-acct-id` |
+| `KINGDEE_USERNAME` | 集成用户名 | `your-username` |
+| `KINGDEE_APP_ID` | 应用ID | `your-app-id` |
+| `KINGDEE_APP_SEC` | 应用密钥（AppSecret） | `your-app-secret` |
 | `MCP_SQLSERVER_HOST` | SQL Server 主机（可选，用于数据库探查） | `localhost` |
 | `MCP_SQLSERVER_PORT` | SQL Server 端口（默认 1433） | `1433` |
 | `MCP_SQLSERVER_DATABASE` | 数据库名 | `AIS20260309171043` |

@@ -1,6 +1,6 @@
 """端到端 smoke：登录 + 查询销售订单。
 
-凭证由环境变量提供（参考 CLAUDE.md：本地存于 C:\\Users\\ZnL\\kingdee-mcp.bat）。
+凭证由环境变量提供（参考 CLAUDE.md）。
 未配置 KINGDEE_* 时由 conftest 静默跳过。
 """
 import pytest

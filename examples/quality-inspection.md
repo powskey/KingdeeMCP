@@ -46,7 +46,7 @@
       "FBillNo": "IQC2026040002",
       "FDate": "2026-04-10",
       "FDocumentStatus": "C",
-      "FSupplierId.FName": "广州天河贸易",
+      "FSupplierId.FName": "示例供应商B",
       "FMaterialId.FName": "铝板",
       "FPassQty": 200.0,
       "FFailQty": 0.0,

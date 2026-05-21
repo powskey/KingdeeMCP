@@ -5,13 +5,13 @@ MCP 场景测试 - 我来扮演 AI 用户，测试 kingdee-mcp 的各个场景
 import json, asyncio, sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-# 设置环境变量
-os.environ["KINGDEE_SERVER_URL"] = "http://wcl/k3cloud/"
-os.environ["KINGDEE_ACCT_ID"] = "69ae8ed35dab20"
-os.environ["KINGDEE_USERNAME"] = "demo"
-os.environ["KINGDEE_APP_ID"] = "338898_x+bC0diL0pD8x+8EWe3CUayNygSaSDoI"
-os.environ["KINGDEE_APP_SEC"] = "f8b75d4cc5484c98a8803f7b045e06be"
-os.environ["KINGDEE_LCID"] = "2052"
+# 环境变量从外部传入（运行前先 export/set），未设置时给占位符默认值
+os.environ.setdefault("KINGDEE_SERVER_URL", "http://your-server/k3cloud/")
+os.environ.setdefault("KINGDEE_ACCT_ID", "your-acct-id")
+os.environ.setdefault("KINGDEE_USERNAME", "your-username")
+os.environ.setdefault("KINGDEE_APP_ID", "your-app-id")
+os.environ.setdefault("KINGDEE_APP_SEC", "your-app-secret")
+os.environ.setdefault("KINGDEE_LCID", "2052")
 
 from kingdee_mcp.server import (
     kingdee_list_forms, kingdee_get_fields,

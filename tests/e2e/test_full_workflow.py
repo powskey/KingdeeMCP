@@ -1,7 +1,7 @@
 """端到端工作流测试（需真实金蝶环境）。
 
 涵盖：销售订单 CRUD、查询/视图、采购下推、工作流、SQL 探查、元数据、附加查询。
-凭证由环境变量提供（CLAUDE.md：本地存于 C:\\Users\\ZnL\\kingdee-mcp.bat）。
+凭证由环境变量提供（参考 CLAUDE.md）。
 未配置 KINGDEE_* 时由 conftest 静默跳过。
 
 注意：单据编码（CUST0001/VEN00001/1.01.001.0001 等）和已有 FID 的断言是 demo 账套约定，

@@ -151,7 +151,8 @@ class TestMetadataTools:
         parsed = json.loads(result)
         assert parsed["form_id"] == "UNKNOWN_FORM"
         assert parsed["name"] == "未知表单"
-        assert "common_fields" in parsed
+        # 未知表单时仍返回 recommended_fields 作为通用字段提示
+        assert "recommended_fields" in parsed
 
 
 # ─── 错误模式匹配 + next-action ───────────────────────────────

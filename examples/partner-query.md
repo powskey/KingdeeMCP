@@ -52,8 +52,8 @@
     {
       "FCustomerId": "50001",
       "FNumber": "C001",
-      "FName": "上海华通贸易有限公司",
-      "FShortName": "华通贸易",
+      "FName": "示例客户贸易有限公司",
+      "FShortName": "示例客户",
       "FContact": "张三",
       "FPhone": "021-88888888"
     }
@@ -66,8 +66,8 @@
 | 对象 | filter_string |
 |------|---------------|
 | 按编码 | `FNumber='C001'` |
-| 按名称模糊 | `FName like '%华通%'` |
-| 按简称 | `FShortName='华通'` |
+| 按名称模糊 | `FName like '%示例%'` |
+| 按简称 | `FShortName='示例客户'` |
 
 ## 注意事项
 

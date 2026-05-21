@@ -42,7 +42,7 @@
       "FBillNo": "CGRK2026030002",
       "FDate": "2026-03-10",
       "FDocumentStatus": "C",
-      "FSupplierId.FName": "广州天河贸易",
+      "FSupplierId.FName": "示例供应商B",
       "FTotalAmount": "9500.00"
     },
     {

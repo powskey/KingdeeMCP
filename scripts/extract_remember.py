@@ -19,8 +19,9 @@ if sys.platform == "win32":
     import io
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
 
-MEMORY_FILE = os.path.join(
-    os.path.dirname(__file__), "..", "C:\\Users\\ZnL\\.claude\\projects\\D--projects\\memory\\MEMORY.md"
+MEMORY_FILE = os.environ.get(
+    "KINGDEE_MCP_MEMORY_FILE",
+    os.path.join(os.path.dirname(__file__), "..", "memory", "MEMORY.md"),
 )
 REMEMBER_PATTERN = re.compile(r"#\s*💡\s*REMEMBER:\s*(.+)")
 DEFAULT_SCAN_DIR = os.path.join(os.path.dirname(__file__), "..", "src")

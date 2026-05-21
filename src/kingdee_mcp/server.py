@@ -14,6 +14,7 @@ import time
 from datetime import datetime
 from typing import Any, List, Literal, Optional, Callable
 from collections import defaultdict
+from dataclasses import dataclass, field
 
 import httpx
 from mcp.server.fastmcp import FastMCP
@@ -654,10 +655,297 @@ _EP = {
     "sequence":     "Kingdee.BOS.WebApi.ServicesStub.SequenceRuleService.QuerySequenceRule.common.kdsvc",
     "number_rule":   "Kingdee.BOS.WebApi.ServicesStub.NumberRuleService.QueryNumberRule.common.kdsvc",
     "sysconfig":    "Kingdee.BOS.WebApi.ServicesStub.SystemConfigService.QuerySystemConfig.common.kdsvc",
+    "metadata":    "Kingdee.BOS.WebApi.ServicesStub.DynamicFormService.QueryBusinessInfo.common.kdsvc",
 }
 
 # Session 缓存（避免每次请求都重新登录）
 _session_id: Optional[str] = None
+
+# ─────────────────────────────────────────────
+# 元数据缓存（用于自动纠错）
+# ─────────────────────────────────────────────
+_METADATA_CACHE: dict[str, Optional[dict]] = {}  # form_id -> metadata
+
+
+@dataclass
+class FieldDef:
+    """字段定义"""
+    name: str
+    caption: str = ""
+    field_type: str = ""
+    field_type_key: str = ""
+    must_input: bool = False
+    is_entry: bool = False
+    children: List["FieldDef"] = field(default_factory=list)
+
+
+class MetadataValidator:
+    """
+    基于元数据的字段验证和自动修正器
+    直接使用 QueryBusinessInfo 接口获取真实字段定义
+    """
+    _cache: dict[str, "MetadataValidator"] = {}
+
+    def __init__(self, metadata: dict):
+        self.metadata = metadata
+        self.fields: dict[str, FieldDef] = {}
+        self._parse_fields()
+
+    @classmethod
+    def get(cls, form_id: str) -> Optional["MetadataValidator"]:
+        """获取缓存的验证器"""
+        return cls._cache.get(form_id)
+
+    @classmethod
+    def set(cls, form_id: str, validator: "MetadataValidator"):
+        """设置缓存"""
+        cls._cache[form_id] = validator
+
+    @staticmethod
+    def _zh_name(name_list: list) -> str:
+        """从多语言 Name 数组提取中文名（LocaleId=2052）"""
+        if not isinstance(name_list, list):
+            return ""
+        for item in name_list:
+            if isinstance(item, dict) and item.get("Key") == 2052:
+                return item.get("Value", "") or ""
+        # 退而求其次取第一个
+        if name_list and isinstance(name_list[0], dict):
+            return name_list[0].get("Value", "") or ""
+        return ""
+
+    @staticmethod
+    def _field_type_label(f: dict) -> str:
+        """根据 LookUpObjectFormId / FieldType 推断字段类型语义"""
+        lookup = f.get("LookUpObjectFormId")
+        if lookup:
+            return f"BaseField->{lookup}"
+        # FieldType 是数字编码，无法精确翻译；用 ElementType 辅助
+        ft = f.get("FieldType")
+        et = f.get("ElementType")
+        if ft is None:
+            return ""
+        return f"FieldType={ft}" + (f",ElementType={et}" if et is not None else "")
+
+    def _parse_fields(self):
+        """解析所有字段定义（适配 QueryBusinessInfo 实际返回结构）
+
+        结构：Result.NeedReturnData.Entrys[]
+          - FBillHead (ParentKey=None) → 主表字段平铺到顶层
+          - 其他 ParentKey=None 的 Entry → 分录/子单头
+          - ParentKey != None → 子分录（暂作为父分录的子集忽略）
+        """
+        nrd = self.metadata.get("Result", {}).get("NeedReturnData")
+        if not isinstance(nrd, dict):
+            return
+
+        for ent in nrd.get("Entrys", []) or []:
+            key = ent.get("Key")
+            if not key:
+                continue
+            if ent.get("ParentKey"):
+                # 子分录暂不展开，仅保留父分录信息
+                continue
+
+            caption = self._zh_name(ent.get("Name", []))
+
+            if key == "FBillHead":
+                # 主表字段：平铺到顶层
+                for f in ent.get("Fields", []) or []:
+                    fkey = f.get("Key")
+                    if not fkey:
+                        continue
+                    self.fields[fkey] = FieldDef(
+                        name=fkey,
+                        caption=self._zh_name(f.get("Name", [])),
+                        field_type=self._field_type_label(f),
+                        field_type_key=str(f.get("FieldType", "")),
+                        must_input=bool(f.get("MustInput")),
+                        is_entry=False,
+                    )
+            else:
+                # 分录或子单头：作为一个 entry 字段，children 为其内部字段
+                children = []
+                for f in ent.get("Fields", []) or []:
+                    fkey = f.get("Key")
+                    if not fkey:
+                        continue
+                    children.append(FieldDef(
+                        name=fkey,
+                        caption=self._zh_name(f.get("Name", [])),
+                        field_type=self._field_type_label(f),
+                        field_type_key=str(f.get("FieldType", "")),
+                        must_input=bool(f.get("MustInput")),
+                    ))
+                self.fields[key] = FieldDef(
+                    name=key,
+                    caption=caption,
+                    is_entry=True,
+                    children=children,
+                )
+
+    def get_valid_field_names(self) -> List[str]:
+        """获取所有有效字段名"""
+        names = []
+        for name, d in self.fields.items():
+            if d.is_entry:
+                names.append(name)  # 分录实体名
+                for c in d.children:
+                    names.append(f"{name}.{c.name}")  # 分录.字段名
+            else:
+                names.append(name)
+        return names
+
+    def get_required_fields(self) -> List[str]:
+        """获取必填字段（不含分录内字段）"""
+        return [n for n, d in self.fields.items() if d.must_input and not d.is_entry]
+
+    def find_similar_field(self, wrong_name: str) -> Optional[str]:
+        """
+        查找相似字段（智能纠错）
+        策略：去掉多余字符匹配
+        """
+        valid_names = list(self.fields.keys())
+
+        # 策略：常见拼写错误模式
+        corrections = [
+            ("FSales", "FSale"),  # FSalesOrgId -> FSaleOrgId
+        ]
+
+        for wrong_prefix, correct_prefix in corrections:
+            if wrong_prefix in wrong_name:
+                candidate = wrong_name.replace(wrong_prefix, correct_prefix, 1)
+                if candidate in valid_names:
+                    return candidate
+
+        # 通用模糊匹配：找前缀相同的
+        for valid in valid_names:
+            if valid.startswith("F") and wrong_name.startswith("F"):
+                # 检查前半部分
+                for i in range(2, min(len(wrong_name), len(valid))):
+                    if wrong_name[:i] == valid[:i] and len(set(wrong_name[i:]) - set(valid[i:])) <= 1:
+                        return valid
+
+        return None
+
+    def validate_and_fix(self, payload: dict) -> tuple[dict, List[dict]]:
+        """
+        验证并修正请求参数
+
+        Returns:
+            (修正后的payload, 修正列表 [{"from": "...", "to": "...", "location": "..."}])
+        """
+        import copy
+        fixed_payload = copy.deepcopy(payload)
+        fixes = []
+
+        # 1. 修正顶层字段（不含 FBillHead）
+        for key in list(fixed_payload.keys()):
+            if key in ("FBillHead", "Creator", "CreateDate", "Modifier", "ModifyDate", "FID"):
+                continue
+            if key not in self.fields:
+                corrected = self.find_similar_field(key)
+                if corrected:
+                    fixed_payload[corrected] = fixed_payload.pop(key)
+                    fixes.append({"from": key, "to": corrected, "location": "顶层"})
+
+        # 2. 修正 FBillHead 下的字段
+        if "FBillHead" in fixed_payload and isinstance(fixed_payload["FBillHead"], dict):
+            bill_head = fixed_payload["FBillHead"]
+            for key in list(bill_head.keys()):
+                if key not in self.fields:
+                    corrected = self.find_similar_field(key)
+                    if corrected:
+                        bill_head[corrected] = bill_head.pop(key)
+                        fixes.append({"from": f"FBillHead.{key}", "to": f"FBillHead.{corrected}", "location": "FBillHead"})
+
+        # 3. 修正分录内的字段
+        for entry_name, entry_def in self.fields.items():
+            if entry_def.is_entry and entry_name in fixed_payload:
+                valid_entry_fields = set(c.name for c in entry_def.children)
+                if isinstance(fixed_payload[entry_name], list):
+                    for idx, entry in enumerate(fixed_payload[entry_name]):
+                        if isinstance(entry, dict):
+                            for key in list(entry.keys()):
+                                if key not in valid_entry_fields:
+                                    corrected = self.find_similar_field(key)
+                                    if corrected:
+                                        entry[corrected] = entry.pop(key)
+                                        fixes.append({"from": f"{entry_name}[{idx}].{key}", "to": f"{entry_name}[{idx}].{corrected}", "location": entry_name})
+
+        return fixed_payload, fixes
+
+
+async def _query_metadata(form_id: str) -> Optional[dict]:
+    """
+    查询表单元数据（带缓存）
+
+    Returns:
+        元数据字典，失败返回 None
+    """
+    global _METADATA_CACHE, _session_id
+
+    # 检查缓存
+    if form_id in _METADATA_CACHE:
+        return _METADATA_CACHE[form_id]
+
+    try:
+        body = json.dumps({"FormId": form_id}, ensure_ascii=False)
+
+        async def _do_post(session: str, client: httpx.AsyncClient) -> httpx.Response:
+            # 金蝶 WebAPI 统一使用 form-urlencoded + data 字段（JSON 字符串）
+            return await client.post(
+                _url("metadata"),
+                data={"data": body},
+                headers={
+                    "Cookie": f"kdservice-sessionid={session}",
+                },
+            )
+
+        async with httpx.AsyncClient(timeout=30, proxy=None,
+                                      transport=httpx.AsyncHTTPTransport(http1=True)) as client:
+            if not _session_id:
+                await _login()
+
+            resp = await _do_post(_session_id, client)
+
+            # session 过期则重新登录重试一次
+            if resp.status_code == 401 or (
+                resp.status_code == 200 and
+                ("会话" in resp.text or "session" in resp.text.lower())
+            ):
+                await _login()
+                resp = await _do_post(_session_id, client)
+
+            resp.raise_for_status()
+            result = resp.json()
+
+            # 缓存结果
+            _METADATA_CACHE[form_id] = result
+            return result
+    except Exception:
+        return None
+
+
+async def _get_metadata_validator(form_id: str) -> Optional[MetadataValidator]:
+    """获取元数据验证器（带缓存）"""
+    # 先检查内存缓存
+    validator = MetadataValidator.get(form_id)
+    if validator:
+        return validator
+
+    # 获取元数据
+    metadata = await _query_metadata(form_id)
+    if not metadata:
+        return None
+
+    # 创建验证器并缓存
+    validator = MetadataValidator(metadata)
+    MetadataValidator.set(form_id, validator)
+    return validator
+
+
+# 💡 REMEMBER: 元数据自动纠错 - 使用 QueryBusinessInfo 验证和修正字段名
 
 # ─────────────────────────────────────────────
 # 常用表单目录（form_id 映射）
@@ -1113,6 +1401,50 @@ FORM_CATALOG = {
         "desc": "记录企业应收客户的款项，由销售出库单下推或手工创建。",
         "fields": "FID,FBillNo,FDate,FDocumentStatus,FCustId.FName,FAmount,FCloseStatus",
         "db_tables": ("T_AR_RECEIVABLE", "T_AR_RECEIVABLEENTRY"),
+    },
+
+    # ══════════════════════════════════════════════════════
+    # 二开单据
+    # ══════════════════════════════════════════════════════
+
+    "TRNV_Receipt": {
+        "name": "二开收款单",
+        "alias": ["收款单", "二开收款", "SKD"],
+        "desc": "二开定制的收款单（不走标准 AR_Receivable），支持从销售订单或销售订单收款计划下推生成。",
+        "fields": "FID,FBillNo,FDocumentStatus,F_TRNV_BusinessDate",
+        "db_tables": ("TRNV_t_Cust100002", "TRNV_t_Cust_Entry100007"),
+        "entity_key": "FEntity",
+        "entry_fields": {
+            "TRNV_t_Cust_Entry100007": "FEntryID,F_TRNV_Amount_bh8,F_TRNV_SourceBillType_986,F_TRNV_SourceBillNo_0ev,F_TRNV_ReceiveType,F_TRNV_PONo,F_TRNV_Material,F_TRNV_Qty2,F_TRNV_OriginalPrice,F_TRNV_UnitPrice"
+        },
+        "business_rules": {
+            "源单关联": "F_TRNV_SourceBillNo_0ev 存销售订单号(FBILLNO)；FEntity_Link.STableName ∈ {T_SAL_ORDERENTRY(按销售订单分录), T_SAL_ORDERPLAN(按销售订单收款计划)}",
+            "金额字段": "明细收款金额 = F_TRNV_Amount_bh8",
+            "已收汇总": "SUM(F_TRNV_Amount_bh8) WHERE FDOCUMENTSTATUS='C' GROUP BY F_TRNV_SourceBillNo_0ev",
+            "反写约束": "不走标准 AR 链路，标准收款审核插件不监听本单；销售订单 FRECEIVEDAMOUNT 需自定义审核后插件反写",
+            "字段命名": "金蝶 BOS WebAPI 字段名混合大小写（如 F_TRNV_Amount_bh8），不是全大写",
+        },
+    },
+
+    "TRNV_PaymentSlip": {
+        "name": "二开付款单",
+        "alias": ["付款单", "二开付款", "FKD"],
+        "desc": "二开定制的付款单（不走标准 AP_Payable），支持从采购订单或采购订单付款计划下推生成。F_TRNV_SONo 用于回挂对应销售订单做毛利闭环。",
+        "fields": "FID,FBillNo,FDocumentStatus,F_TRNV_BusinessDate,F_TRNV_Base_hpu",
+        "db_tables": ("TRNV_t_Cust100003", "TRNV_t_Cust_Entry100008"),
+        "entity_key": "FEntity",
+        "entry_fields": {
+            "TRNV_t_Cust_Entry100008": "FEntryID,F_TRNV_Amount_bh8,F_TRNV_SourceBillType_986,F_TRNV_SourceBillNo_0ev,F_TRNV_PushDownType,F_TRNV_SONo,F_TRNV_Qty,F_TRNV_MaterialId,F_TRNV_OriginalPrice,F_TRNV_UnitPrice,F_TRNV_WaterBillNumber"
+        },
+        "business_rules": {
+            "源单关联": "F_TRNV_SourceBillNo_0ev 存采购订单号；F_TRNV_SONo 冗余存关联销售订单号(用于毛利闭环对账)",
+            "_LK 源表": "FEntity_Link.STableName ∈ {t_PUR_POOrderEntry(按订单分录下推), T_PUR_POORDERINSTALLMENT(按付款计划下推)}",
+            "PushDownType": "1=按付款计划下推(对应 T_PUR_POORDERINSTALLMENT)；2/3=按订单分录下推(对应 t_PUR_POOrderEntry)",
+            "金额字段": "明细付款金额 = F_TRNV_Amount_bh8",
+            "反写约束": "不走标准 AP 链路；采购订单已付金额需自定义审核后插件反写",
+            "毛利闭环": "同一笔销售：SUM(收款.F_TRNV_Amount_bh8 WHERE F_TRNV_SourceBillNo_0ev=SO号) - SUM(付款.F_TRNV_Amount_bh8 WHERE F_TRNV_SONo=SO号)",
+            "字段命名": "金蝶 BOS WebAPI 字段名混合大小写（如 F_TRNV_Amount_bh8），不是全大写",
+        },
     },
 
     # ══════════════════════════════════════════════════════
@@ -1788,6 +2120,10 @@ class ViewInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
     form_id: str = Field(..., description="单据类型标识")
     bill_id: str = Field(..., description="单据内码 FID")
+    mode: str = Field(
+        default="summary",
+        description="返回模式: summary(精简,关联字段只保留 Id/Number/Name) | full(完整原始数据)",
+    )
 
 
 class SaveInput(BaseModel):
@@ -1819,8 +2155,8 @@ class MaterialQueryInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
     filter_string: str = Field(default="", description="过滤条件，如 \"FNumber like 'HG%'\"")
     field_keys: str = Field(
-        default="FMaterialId,FNumber,FName,FSpecification,FUnitId.FName,FMaterialGroup.FName",
-        description="返回字段"
+        default="FMaterialId,FNumber,FName,FSpecification,FMaterialGroup.FName",
+        description="返回字段（如需单位用 FBaseUnitId.FName）"
     )
     start_row: int = Field(default=0, ge=0)
     limit: int = Field(default=20, ge=1, le=100)
@@ -1831,8 +2167,8 @@ class PartnerQueryInput(BaseModel):
     partner_type: str = Field(..., description="BD_Customer（客户）或 BD_Supplier（供应商）")
     filter_string: str = Field(default="", description="过滤条件")
     field_keys: str = Field(
-        default="FCustomerID,FNumber,FName,FShortName,FContact,FPhone",
-        description="返回字段"
+        default="FNumber,FName,FShortName,FContact,FPhone,FDocumentStatus",
+        description="返回字段（如需主键 FID，客户用 FCustId、供应商用 FSupplierId）"
     )
     start_row: int = Field(default=0, ge=0)
     limit: int = Field(default=20, ge=1, le=100)
@@ -1889,15 +2225,53 @@ async def kingdee_query_bills(params: QueryInput) -> str:
 async def kingdee_view_bill(params: ViewInput) -> str:
     """根据单据内码 FID 获取单据完整详情（含所有分录字段）。
 
+    mode=summary（默认）：关联字段只保留 Id / Number / Name，大幅缩减体积，
+        适合参照旧单建新单。完整数据动辄 10 万字符，summary 通常在 1 万以内。
+    mode=full：返回原始 JSON。
+
     Returns:
-        str: JSON 格式的完整单据数据
+        str: JSON 格式的单据数据
     """
     try:
         # View 使用 _post_raw（raw JSON body + 小写 formid，无 Model 包装）
         result = await _post_raw("view", params.form_id, {"Id": params.bill_id})
-        return _fmt(result)
+        if params.mode == "full":
+            return _fmt(result)
+        return _fmt(_simplify_view_result(result))
     except Exception as e:
         return _err(e)
+
+
+def _simplify_view_result(data: Any) -> Any:
+    """
+    精简 view 返回：关联字段对象只保留 Id/Number/Name，去除 MultiLanguageText 等冗余。
+    用于 view_bill summary 模式。
+    """
+    if isinstance(data, dict):
+        # 关联基础资料对象的特征：含 Id 且含 Number 或 MultiLanguageText
+        has_id = "Id" in data or "FID" in data
+        has_number = "Number" in data
+        has_mlt = "MultiLanguageText" in data
+        if has_id and (has_number or has_mlt):
+            slim: dict = {}
+            if "Id" in data:
+                slim["Id"] = data["Id"]
+            if "FID" in data and "Id" not in slim:
+                slim["Id"] = data["FID"]
+            if "Number" in data:
+                slim["Number"] = data["Number"]
+            # 提取中文名
+            if has_mlt:
+                for item in data.get("MultiLanguageText", []):
+                    if item.get("LocaleId") == 2052 and item.get("Name", "").strip():
+                        slim["Name"] = item["Name"]
+                        break
+            return slim
+        # 普通字典递归
+        return {k: _simplify_view_result(v) for k, v in data.items()}
+    if isinstance(data, list):
+        return [_simplify_view_result(item) for item in data]
+    return data
 
 
 @mcp.tool(
@@ -2164,6 +2538,7 @@ async def kingdee_save_bill(params: SaveInput) -> str:
 
     - 新建：model 中不传 FID
     - 修改：model 中必须传 FID，并设置 is_delete_entry=false 防止分录被删
+    - 自动纠错：如字段名拼写错误（如 FSalesOrgId→FSaleOrgId），会自动修正
 
     新建采购订单 model 示例：
     {
@@ -2185,6 +2560,12 @@ async def kingdee_save_bill(params: SaveInput) -> str:
         # 新建时 FID 设为 0，修改时保留原 FID
         model.setdefault("FID", 0)
 
+        # 尝试自动修正字段名（基于元数据）
+        auto_fixes = []
+        validator = await _get_metadata_validator(params.form_id)
+        if validator:
+            model, auto_fixes = validator.validate_and_fix(model)
+
         result = await _post_raw(
             "save",
             params.form_id,
@@ -2198,6 +2579,10 @@ async def kingdee_save_bill(params: SaveInput) -> str:
         status_data = _result_status(result, "save")
         if status_data.get("success"):
             status_data["tip"] = "单据已保存为草稿，需要提交+审核后才能生效"
+            # 如果有自动修正，记录到结果中
+            if auto_fixes:
+                status_data["auto_fixes"] = auto_fixes
+                status_data["tip"] += f"（自动修正了 {len(auto_fixes)} 处字段名）"
         return _fmt(status_data)
     except Exception as e:
         return _err(e, op="save")
@@ -2988,6 +3373,14 @@ class FormSearchInput(BaseModel):
 class FieldQueryInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
     form_id: str = Field(..., description="表单标识，如 BD_Material、PUR_PurchaseOrder")
+    entry_key: str = Field(
+        default="",
+        description="分录/子单头 Key（如 FSaleOrderEntry / FSaleOrderFinance），传入则只返回该分录字段。默认返回主表字段+所有分录概览",
+    )
+    verbose: bool = Field(
+        default=False,
+        description="True 时返回所有主表字段；默认仅返回必填字段+关联基础资料字段（base field），其余压缩为名称列表",
+    )
 
 
 @mcp.tool(
@@ -3045,54 +3438,160 @@ async def kingdee_get_fields(params: FieldQueryInput) -> str:
     """获取指定表单的完整字段信息和业务规则。
 
     不知道查询哪些字段时，或需要了解表单的业务限制时，先调用此工具。
+    本工具会调用金蝶 QueryBusinessInfo 接口拉取真实字段定义（带缓存）。
 
     返回内容：
-    - recommended_fields: 推荐查询字段
-    - field_list: 字段数组
-    - db_tables: 对应数据库表名
-    - business_rules: 关键业务规则（如下推限制、状态枚举等）
+    - name/desc/db_tables/business_rules: 来自本地表单目录
+    - recommended_fields: 推荐查询字段（精简版，给 LLM 看的）
+    - metadata.fields: 所有主表字段（含 caption/type/must）
+    - metadata.entries: 所有分录子表及其字段
+    - metadata.required_fields: 主表必填字段列表
+    - save_template: 自动生成的最小可保存 model 骨架（仅含必填字段）
 
     字段格式说明：
     - FXxx 是普通字段
     - FXxx.FName 是关联字段取名称（例：FSupplierId.FName）
     - FXxx.FNumber 是关联字段取编码（例：FSupplierId.FNumber）
-    - FXxx.fstbl_FIRSTKEYFIELDNAME 是关联字段取FID（用于保存/过滤）
 
     Returns:
         str: JSON 格式的字段信息
     """
     form_id = params.form_id
-    info = FORM_CATALOG.get(form_id)
+    info = FORM_CATALOG.get(form_id) or {}
 
-    if info:
-        return _fmt({
-            "form_id": form_id,
-            "name": info["name"],
-            "desc": info.get("desc", ""),
-            "recommended_fields": info["fields"],
-            "field_list": [f.strip() for f in info["fields"].split(",")],
-            "db_tables": info.get("db_tables", ()),
-            "business_rules": info.get("business_rules", {}),
-            "单据状态枚举": {
-                "A": "创建",
-                "B": "审核中",
-                "C": "已审核",
-                "D": "重新审核",
-                "Z": "暂存",
-            },
-            "通用状态枚举": {
-                "A": "正常/未关闭",
-                "B": "已关闭/冻结/终止/业务关闭",
-            },
-        })
+    result: dict[str, Any] = {
+        "form_id": form_id,
+        "name": info.get("name", "未知表单"),
+        "desc": info.get("desc", ""),
+        "recommended_fields": info.get(
+            "fields",
+            "FID,FBillNo,FNumber,FName,FDate,FDocumentStatus",
+        ),
+        "db_tables": info.get("db_tables", ()),
+        "business_rules": info.get("business_rules", {}),
+        "单据状态枚举": {
+            "A": "创建", "B": "审核中", "C": "已审核",
+            "D": "重新审核", "Z": "暂存",
+        },
+        "通用状态枚举": {
+            "A": "正常/未关闭", "B": "已关闭/冻结/终止/业务关闭",
+        },
+    }
+
+    # 调用 QueryBusinessInfo 获取真实字段定义
+    try:
+        validator = await _get_metadata_validator(form_id)
+    except Exception:
+        validator = None
+
+    if not (validator and validator.fields):
+        result["metadata_tip"] = (
+            "QueryBusinessInfo 未返回元数据，已退回本地目录字段。"
+            "若需完整字段，请确认服务连通和该表单存在。"
+        )
+        return _fmt(result)
+
+    # 分离主表字段 vs 分录
+    main_fields = []
+    entries: dict[str, FieldDef] = {}
+    required_main: List[str] = []
+    for name, fd in validator.fields.items():
+        if fd.is_entry:
+            entries[name] = fd
+        else:
+            main_fields.append(fd)
+            if fd.must_input:
+                required_main.append(fd.name)
+
+    def _slim(fd: FieldDef) -> dict:
+        d = {"name": fd.name, "caption": fd.caption}
+        if fd.must_input:
+            d["must"] = True
+        if fd.field_type and fd.field_type.startswith("BaseField->"):
+            d["lookup"] = fd.field_type.split("->", 1)[1]
+        return d
+
+    # 模式 1: 钻取指定分录
+    if params.entry_key:
+        ent = entries.get(params.entry_key)
+        if ent is None:
+            # 也可能是用户传了主表名
+            result["error"] = f"entry_key '{params.entry_key}' 不存在，可用 entry_key: {list(entries.keys())}"
+            return _fmt(result)
+        result["entry"] = {
+            "key": ent.name,
+            "caption": ent.caption,
+            "field_count": len(ent.children),
+            "required": [c.name for c in ent.children if c.must_input],
+            "fields": [_slim(c) for c in ent.children],
+        }
+        return _fmt(result)
+
+    # 模式 2: 概览（默认）
+    # 主表：默认仅返回必填 + 关联基础资料字段；verbose=True 返回全部
+    if params.verbose:
+        main_returned = [_slim(fd) for fd in main_fields]
+        omitted = 0
     else:
-        # 返回通用建议
-        return _fmt({
-            "form_id": form_id,
-            "name": "未知表单",
-            "tip": "此表单不在常用目录中，建议尝试以下通用字段：FID,FBillNo,FNumber,FName,FDate,FDocumentStatus",
-            "common_fields": ["FID", "FBillNo", "FNumber", "FName", "FDate", "FDocumentStatus", "FCreateDate", "FModifyDate"],
-        })
+        important = [
+            fd for fd in main_fields
+            if fd.must_input or (fd.field_type or "").startswith("BaseField->")
+        ]
+        main_returned = [_slim(fd) for fd in important]
+        omitted = len(main_fields) - len(important)
+
+    entries_summary = {}
+    for name, ent in entries.items():
+        entries_summary[name] = {
+            "caption": ent.caption,
+            "field_count": len(ent.children),
+            "required": [c.name for c in ent.children if c.must_input],
+        }
+
+    result["metadata"] = {
+        "source": "QueryBusinessInfo",
+        "main_field_count": len(main_fields),
+        "main_required_count": len(required_main),
+        "main_required_fields": required_main,
+        "main_fields_returned": len(main_returned),
+        "main_fields_omitted_non_required": omitted,
+        "main_fields": main_returned,
+        "entry_count": len(entries),
+        "entries": entries_summary,
+        "tip": (
+            "传 entry_key='<分录Key>' 钻取分录字段；"
+            "传 verbose=true 返回所有主表字段"
+        ),
+    }
+
+    # 生成 save 模板骨架
+    def _placeholder(fd: FieldDef) -> Any:
+        ftype = (fd.field_type or "").lower()
+        if ftype.startswith("basefield->"):
+            return {"FNumber": ""}
+        # FieldType 数字编码常见映射（来自 ElementType 经验值）
+        ftk = fd.field_type_key or ""
+        if any(x in ftype or x in fd.name.lower() for x in ("date",)):
+            return "YYYY-MM-DD"
+        if any(x in fd.name.lower() for x in ("qty", "price", "amount", "rate")):
+            return 0
+        if ftk in ("232", "233"):  # decimal
+            return 0
+        return ""
+
+    template: dict[str, Any] = {}
+    for fd in main_fields:
+        if fd.must_input:
+            template[fd.name] = _placeholder(fd)
+    for name, ent in entries.items():
+        required_children = [c for c in ent.children if c.must_input]
+        if required_children:
+            row = {c.name: _placeholder(c) for c in required_children}
+            template[name] = [row]
+    if template:
+        result["save_template"] = template
+
+    return _fmt(result)
 
 
 # ─────────────────────────────────────────────
